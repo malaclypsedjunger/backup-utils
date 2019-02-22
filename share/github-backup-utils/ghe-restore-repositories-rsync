@@ -36,12 +36,44 @@ trap 'cleanup' INT TERM EXIT
 ghe-gc-disable $GHE_HOSTNAME
 
 # Transfer all git repository data from the latest snapshot to the GitHub
-# instance in a single rsync invocation.
-ghe-rsync -avH --delete \
-    --exclude ".sync_in_progress" \
-    -e "ghe-ssh -p $(ssh_port_part "$GHE_HOSTNAME")" \
-    --rsync-path="sudo -u git rsync" \
-    "$GHE_DATA_DIR/$GHE_RESTORE_SNAPSHOT/repositories/" \
-    "$(ssh_host_part "$GHE_HOSTNAME"):$GHE_REMOTE_DATA_USER_DIR/repositories" 1>&3
+# using multiple concurrent rsyncs.
+# Break up the transfer by top level directory under repositories/
+# and do each one in parallel (there should be 17 of them - with the 'info"
+# directory being a very small directory).
+# On a system with 16 or more cores, it probably pays to break up the list
+# of files into more than 17 groups (even with fewer cores, a finer break up
+# will help "even out" the completions times and achieve more effective
+# parallelism but I would like buy in to this approach before doing the
+# work to do that).
+# Be sure to disable the sharing of a persistent ssh connection as that would
+# defeat the purpose of doing things in parallel.
+export GHE_DISABLE_SSH_MUX=1
+for item in $GHE_DATA_DIR/$GHE_RESTORE_SNAPSHOT/repositories/*
+do
+	ghe-rsync -avH --delete \
+	    --exclude ".sync_in_progress" \
+	    -e "ghe-ssh -p $(ssh_port_part "$GHE_HOSTNAME")" \
+	    --rsync-path="sudo -u git rsync" \
+	    "$item" \
+	    "$(ssh_host_part "$GHE_HOSTNAME"):$GHE_REMOTE_DATA_USER_DIR/repositories/" 1>&3 &
+done
+
+# wait for all of them to finish and check status
+while "$(jobs -p)" -ne ""
+do
+	wait -n $(jobs -p)
+	if [ $? -ne 0 ]
+	then
+		echo "oops $?"
+		bm_end "$(basename $0)"
+		exit 1
+	else
+		echo "done $?"
+		exit 0
+	fi
+done
 
 bm_end "$(basename $0)"
+
+exit 0
+

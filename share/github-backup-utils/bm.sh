@@ -55,4 +55,7 @@ bm_end() {
   if [ -n "$GHE_DEBUG" ]; then
     echo "Debug: $1 took ${total}s (bm_end)"
   fi
+  # bb metrics
+  metricname="$(echo ${1} | tr -d ' ')"
+  echo "$(date +%s)000|bbgh_br|host=$(hostname)|${metricname}|${total}" >> /var/spool/metrics/backup_restore
 }

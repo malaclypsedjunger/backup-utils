@@ -28,21 +28,49 @@ ghe_remote_version_required "$GHE_HOSTNAME"
 # The directory holding the snapshot to restore
 snapshot_dir="$GHE_DATA_DIR/$GHE_RESTORE_SNAPSHOT"
 
+# creae a temp dir to manipulate the file list
+tempdir=$(mktemp -d -t backup-utils-restore-XXXXXX)
+cleanup() {
+  rm -rf $tempdir
+}
+trap cleanup EXIT
+
 # Transfer all ES data from the latest snapshot to the GitHub instance.
 if [ ! -d "$snapshot_dir/elasticsearch" ]; then
   echo "Warning: Elasticsearch backup missing. Skipping ..."
   exit 0
 
 else
+  # we want to pick up all the files.  but we want to make sure that doing
+  # the split of the files for parallelism is as even as possible (for now, fixed at 32 pieces).
+  # also disable use of the shared/persistent ssh connection.
+  (cd $snapshot_dir/elasticsearch; find . -type f | shuf > $tempdir/es.list)
+  split -d -nl/32 $tempdir/es.list $tempdir/hash_
   ghe-ssh "$GHE_HOSTNAME" -- "sudo mkdir -p '$GHE_REMOTE_DATA_USER_DIR/elasticsearch-restore'" 1>&3
   ghe-ssh "$GHE_HOSTNAME" -- "sudo chown elasticsearch:elasticsearch '$GHE_REMOTE_DATA_USER_DIR/elasticsearch-restore'" 1>&3
 
-  ghe-rsync -avz --delete \
-    -e "ghe-ssh -p $(ssh_port_part "$GHE_HOSTNAME")" \
-    --rsync-path="sudo -u elasticsearch rsync" \
-    --copy-dest="$GHE_REMOTE_DATA_USER_DIR/elasticsearch" \
-    "$snapshot_dir/elasticsearch/" \
-    "$(ssh_host_part "$GHE_HOSTNAME"):$GHE_REMOTE_DATA_USER_DIR/elasticsearch-restore" 1>&3
+  export GHE_DISABLE_SSH_MUX=1
+  for filegroup in $tempdir/hash_*
+  do
+    echo $filegroup >> /tmp/es.debug
+    echo ghe-rsync -avz --delete \
+      -e "ghe-ssh -p $(ssh_port_part "$GHE_HOSTNAME")" \
+      --rsync-path="sudo -u elasticsearch rsync" \
+      --files-from=$filegroup \
+      --copy-dest="$GHE_REMOTE_DATA_USER_DIR/elasticsearch" \
+      "$snapshot_dir/elasticsearch/" \
+      "$(ssh_host_part "$GHE_HOSTNAME"):$GHE_REMOTE_DATA_USER_DIR/elasticsearch-restore" >> /tmp/es.debug
+    ghe-rsync -avz --delete \
+      -e "ghe-ssh -p $(ssh_port_part "$GHE_HOSTNAME")" \
+      --rsync-path="sudo -u elasticsearch rsync" \
+      --files-from=$filegroup \
+      --copy-dest="$GHE_REMOTE_DATA_USER_DIR/elasticsearch" \
+      "$snapshot_dir/elasticsearch/" \
+      "$(ssh_host_part "$GHE_HOSTNAME"):$GHE_REMOTE_DATA_USER_DIR/elasticsearch-restore" 1>&3 &
+  done
+
+  # do a smarter wait
+  wait
 
   # restoring in >=2.14 will remove incompatible indices created with 1.x.
   if [ "$GHE_VERSION_MAJOR" -eq 2 ] && [ "$GHE_VERSION_MINOR" -ge 14 ]; then
